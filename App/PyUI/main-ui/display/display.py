@@ -321,6 +321,8 @@ class Display:
     def deinit_fonts(cls):
         for loaded_font in cls.fonts.values():
             sdl2.sdlttf.TTF_CloseFont(loaded_font.font)
+            if loaded_font.fallback_font is not None:
+                sdl2.sdlttf.TTF_CloseFont(loaded_font.fallback_font)
         cls.fonts.clear()
 
     @classmethod
@@ -402,7 +404,166 @@ class Display:
         else:
             sdl2.SDL_FreeSurface(surface)
 
-        return LoadedFont(font, line_height, font_path)
+        fallback_font = None
+        fallback_font_path = Theme.get_fallback_font()
+        if fallback_font_path and os.path.abspath(fallback_font_path) != os.path.abspath(font_path):
+            fallback_font = sdl2.sdlttf.TTF_OpenFont(fallback_font_path.encode("utf-8"), font_size)
+            if not fallback_font:
+                PyUiLogger.get_logger().warning(
+                    f"Could not load fallback font {fallback_font_path} : {sdl2.sdlttf.TTF_GetError().decode('utf-8')}"
+                )
+            else:
+                line_height = max(line_height, sdl2.sdlttf.TTF_FontHeight(fallback_font))
+
+        return LoadedFont(font, line_height, font_path, fallback_font, fallback_font_path)
+
+    @classmethod
+    def _font_has_glyph(cls, font, char):
+        if font is None or char is None or len(char) == 0:
+            return False
+
+        glyph = ord(char)
+        if glyph == 32:
+            return True
+
+        if hasattr(sdl2.sdlttf, "TTF_GlyphIsProvided32"):
+            return sdl2.sdlttf.TTF_GlyphIsProvided32(font, glyph) != 0
+        if hasattr(sdl2.sdlttf, "TTF_GlyphIsProvided"):
+            return sdl2.sdlttf.TTF_GlyphIsProvided(font, glyph) != 0
+
+        return True
+
+    @classmethod
+    def _get_font_for_character(cls, loaded_font, char):
+        if cls._font_has_glyph(loaded_font.font, char):
+            return loaded_font.font
+        if cls._font_has_glyph(loaded_font.fallback_font, char):
+            return loaded_font.fallback_font
+        return loaded_font.font
+
+    @classmethod
+    def _split_text_into_font_runs(cls, text, loaded_font):
+        if not text:
+            return []
+
+        runs = []
+        current_chars = []
+        current_font = None
+
+        for char in text:
+            run_font = cls._get_font_for_character(loaded_font, char)
+            if current_font is None or run_font == current_font:
+                current_font = run_font
+                current_chars.append(char)
+                continue
+
+            runs.append((current_font, "".join(current_chars)))
+            current_font = run_font
+            current_chars = [char]
+
+        if current_chars:
+            runs.append((current_font, "".join(current_chars)))
+
+        return runs
+
+    @classmethod
+    def _get_font_vertical_metrics(cls, font):
+        if font is None:
+            return 0, 0
+
+        ascent = 0
+        descent = 0
+        if hasattr(sdl2.sdlttf, "TTF_FontAscent"):
+            ascent = max(0, sdl2.sdlttf.TTF_FontAscent(font))
+        if hasattr(sdl2.sdlttf, "TTF_FontDescent"):
+            descent = abs(sdl2.sdlttf.TTF_FontDescent(font))
+
+        if ascent == 0 and descent == 0:
+            return sdl2.sdlttf.TTF_FontHeight(font), 0
+
+        return ascent, descent
+
+    @classmethod
+    def _measure_text_with_loaded_font(cls, loaded_font, text):
+        if text is None or len(text) == 0:
+            return 0, 0
+
+        runs = cls._split_text_into_font_runs(text, loaded_font)
+        total_width = 0
+        max_ascent = 0
+        max_descent = 0
+
+        for run_font, run_text in runs:
+            w = sdl2.Sint32()
+            h = sdl2.Sint32()
+            if sdl2.sdlttf.TTF_SizeUTF8(run_font, run_text.encode("utf-8"), w, h) != 0:
+                PyUiLogger.get_logger().warning(
+                    f"Failed to measure text run '{run_text}': {sdl2.sdlttf.TTF_GetError().decode('utf-8')}"
+                )
+                continue
+
+            total_width += w.value
+            ascent, descent = cls._get_font_vertical_metrics(run_font)
+            max_ascent = max(max_ascent, ascent)
+            max_descent = max(max_descent, descent)
+
+        if max_ascent == 0 and max_descent == 0:
+            return total_width, loaded_font.line_height
+
+        return total_width, max_ascent + max_descent
+
+    @classmethod
+    def _render_text_surface(cls, loaded_font, text, sdl_color):
+        runs = cls._split_text_into_font_runs(text, loaded_font)
+        if len(runs) == 1:
+            run_font, run_text = runs[0]
+            return sdl2.sdlttf.TTF_RenderUTF8_Blended(run_font, run_text.encode("utf-8"), sdl_color)
+
+        rendered_runs = []
+        max_ascent = 0
+        max_descent = 0
+        total_width = 0
+
+        for run_font, run_text in runs:
+            run_surface = sdl2.sdlttf.TTF_RenderUTF8_Blended(run_font, run_text.encode("utf-8"), sdl_color)
+            if not run_surface:
+                for surface, _, _ in rendered_runs:
+                    sdl2.SDL_FreeSurface(surface)
+                return None
+
+            ascent, descent = cls._get_font_vertical_metrics(run_font)
+            rendered_runs.append((run_surface, ascent, descent))
+            total_width += run_surface.contents.w
+            max_ascent = max(max_ascent, ascent)
+            max_descent = max(max_descent, descent)
+
+        total_height = max_ascent + max_descent
+        if total_height <= 0:
+            total_height = max(surface.contents.h for surface, _, _ in rendered_runs)
+
+        final_surface = sdl2.SDL_CreateRGBSurfaceWithFormat(
+            0,
+            total_width,
+            total_height,
+            32,
+            sdl2.SDL_PIXELFORMAT_RGBA32
+        )
+        if not final_surface:
+            for surface, _, _ in rendered_runs:
+                sdl2.SDL_FreeSurface(surface)
+            return None
+
+        transparent = sdl2.SDL_MapRGBA(final_surface.contents.format, 0, 0, 0, 0)
+        sdl2.SDL_FillRect(final_surface, None, transparent)
+
+        x_offset = 0
+        for run_surface, ascent, _ in rendered_runs:
+            dst_rect = sdl2.SDL_Rect(x_offset, max_ascent - ascent, run_surface.contents.w, run_surface.contents.h)
+            sdl2.SDL_BlitSurface(run_surface, None, final_surface, dst_rect)
+            x_offset += run_surface.contents.w
+            sdl2.SDL_FreeSurface(run_surface)
+
+        return final_surface
 
     @classmethod
     def lock_current_image(cls):
@@ -618,11 +779,11 @@ class Display:
             texture = cache.texture
         else:
             sdl_color = sdl2.SDL_Color(color[0], color[1], color[2])
-            surface = sdl2.sdlttf.TTF_RenderUTF8_Blended(loaded_font.font, text.encode('utf-8'), sdl_color)
+            surface = cls._render_text_surface(loaded_font, text, sdl_color)
             if not surface:
                 if not cls.log_sdl_error_and_clear_cache_text(text,purpose):
                     return 0, 0
-                surface = sdl2.sdlttf.TTF_RenderUTF8_Blended(loaded_font.font, text.encode('utf-8'), sdl_color)
+                surface = cls._render_text_surface(loaded_font, text, sdl_color)
                 if not surface:
                     PyUiLogger.get_logger().error(f"Failed to render text surface for {text}: {sdl2.sdlttf.TTF_GetError().decode('utf-8')}")
                     return 0, 0
@@ -1051,10 +1212,8 @@ class Display:
     
     @classmethod
     def get_text_dimensions(cls, purpose, text="A"):
-        w = sdl2.Sint32()
-        h = sdl2.Sint32()
-        sdl2.sdlttf.TTF_SizeUTF8(cls.fonts[purpose].font, text.encode('utf-8'), w, h)
-        return int(w.value * Device.get_device().get_text_width_measurement_multiplier()), h.value
+        w, h = cls._measure_text_with_loaded_font(cls.fonts[purpose], text)
+        return int(w * Device.get_device().get_text_width_measurement_multiplier()), h
     
     @classmethod
     def add_index_text(cls, index, total, force_include_index = False, letter = None):
